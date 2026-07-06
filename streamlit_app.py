@@ -136,6 +136,17 @@ def structure_to_poscar_text(structure) -> str:
     return Poscar(structure).get_string()
 
 
+def get_saved_mp_api_key() -> str:
+    """Reads a saved API key from Streamlit secrets, if one is configured.
+
+    Kept out of session/source code on purpose — see .streamlit/secrets.toml.
+    """
+    try:
+        return st.secrets.get("MP_API_KEY", "")
+    except Exception:
+        return ""
+
+
 def structure_to_cif_text(structure) -> str:
     from pymatgen.io.cif import CifWriter
     return str(CifWriter(structure))
@@ -593,7 +604,15 @@ with tab_mp:
             "3. Paste it below. It's only kept in this browser session, never stored on disk."
         )
 
-    api_key = st.text_input("Materials Project API key", type="password", key="mp_api_key")
+    saved_api_key = get_saved_mp_api_key()
+    api_key = st.text_input(
+        "Materials Project API key",
+        type="password",
+        value=saved_api_key,
+        key="mp_api_key",
+    )
+    if saved_api_key:
+        st.caption("🔑 Using the saved API key from `.streamlit/secrets.toml` — no need to paste it each time. Override above if you want to use a different key for this session.")
 
     # Wrapped in a form so typing the query doesn't trigger a rerun on every
     # keystroke — only "Search" submits.
@@ -664,10 +683,10 @@ with tab_mp:
                             })
                             st.rerun()
 
-                with st.expander(f"🔬 View structure — {mid_str}"):
+                with st.expander(f"🔬 Structure — {mid_str}", expanded=True):
                     cif_text = structure_to_cif_text(d.structure)
                     render_structure_viewer(cif_text, key=mid_str)
-                    st.caption("Drag to rotate • scroll to zoom • double-click to spin")
+                    st.caption("Rendered directly from the Materials Project structure data • drag to rotate • scroll to zoom • double-click to spin")
 
     if st.session_state.mp_queue:
         st.markdown(f"##### 📋 Queued from Materials Project ({len(st.session_state.mp_queue)})")
