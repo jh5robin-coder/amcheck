@@ -623,7 +623,7 @@ st.markdown(
     <div class="am-hero">
         <h1>🧲 Altermagnet Screener</h1>
         <p>Search a structure from the Materials Project, or upload your own VASP files.
-        Click any result to view it in 3D and add it to the queue — then run
+        Click any result and add it to the queue — then run
         <code>amcheck</code> across every u/d spin combination for magnetic elements,
         and get flagged the moment one comes back <b>Altermagnet? True</b>.</p>
     </div>
