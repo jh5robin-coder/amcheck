@@ -14,11 +14,16 @@ Performance notes vs. the original version:
     scrollback on every single printed line.
   * amcheck combinations still run sequentially, one at a time, in the same
     order as the original script.
+  * amcheck subprocess reads now go through a watchdog thread: if a run
+    stalls (no output) or overruns a hard cap, it is killed automatically
+    and the screener moves on to the next combination/file instead of
+    hanging the whole app.
 """
 
 import collections
 import itertools
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -44,7 +49,12 @@ ALTERMAGNET_RE = re.compile(r"Altermagnet\?\s*(True|False)")
 SPIN_PROMPT = "Type spin (u, U, d, D, n, N, nn or NN) for each of them"
 PRIMITIVE_CELL_PROMPT = "Do you want to use it instead? (Y/n)"
 
+# Hard cap on total wall-clock time for a single amcheck invocation.
 SUBPROCESS_TIMEOUT_SECONDS = 120
+# If amcheck goes this long without printing a single new line, we assume
+# it's stuck on a prompt we don't recognize (or otherwise wedged) and kill
+# it rather than let it block the run forever.
+SUBPROCESS_STALL_TIMEOUT_SECONDS = 30
 
 TERMINAL_MAX_LINES = 500
 TERMINAL_FLUSH_EVERY_N_LINES = 15
@@ -78,6 +88,7 @@ def flip(seq: str) -> str:
     return "".join("d" if c == "u" else "u" for c in seq)
 
 
+@st.cache_data(show_spinner=False)
 def generate_combinations(n: int) -> list:
     if n % 2 != 0:
         return []
@@ -197,10 +208,20 @@ class AmcheckRunResult:
         self.lines = []
         self.returncode = None
         self.timed_out = False
+        self.stalled = False
         self.exception = None
 
 
 def _run_amcheck_process(vasp_file_path, respond_fn, stream_cb=None):
+    """Runs amcheck as a subprocess and feeds it responses via respond_fn.
+
+    Reading from proc.stdout happens on a background thread so the main
+    thread never blocks indefinitely: if amcheck goes quiet for longer than
+    SUBPROCESS_STALL_TIMEOUT_SECONDS (e.g. it hit a prompt we don't
+    recognize and is waiting on stdin forever) or the whole run exceeds
+    SUBPROCESS_TIMEOUT_SECONDS, the process is killed automatically and we
+    move on — no manual restart of the app required.
+    """
     result = AmcheckRunResult()
     cmd = ["amcheck", vasp_file_path]
 
@@ -227,39 +248,115 @@ def _run_amcheck_process(vasp_file_path, respond_fn, stream_cb=None):
             stream_cb(f"[ERROR] {result.exception}")
         return result
 
+    line_queue = queue.Queue()
+    SENTINEL = object()
+
+    def _reader():
+        try:
+            for raw_line in proc.stdout:
+                line_queue.put(raw_line.rstrip("\n"))
+        except Exception:
+            pass
+        finally:
+            line_queue.put(SENTINEL)
+
+    reader_thread = threading.Thread(target=_reader, daemon=True)
+    reader_thread.start()
+
+    start_time = time.monotonic()
+    killed = False
+
     try:
-        for line in proc.stdout:
-            line = line.rstrip("\n")
+        while True:
+            elapsed = time.monotonic() - start_time
+            remaining_total = SUBPROCESS_TIMEOUT_SECONDS - elapsed
+            if remaining_total <= 0:
+                result.timed_out = True
+                if stream_cb:
+                    stream_cb("[ERROR] amcheck exceeded max run time and was killed")
+                proc.kill()
+                killed = True
+                break
+
+            wait_for = min(SUBPROCESS_STALL_TIMEOUT_SECONDS, remaining_total)
+            try:
+                item = line_queue.get(timeout=wait_for)
+            except queue.Empty:
+                # No output for SUBPROCESS_STALL_TIMEOUT_SECONDS straight —
+                # amcheck is almost certainly stuck waiting on a prompt we
+                # didn't recognize. Kill it instead of hanging forever.
+                result.stalled = True
+                if stream_cb:
+                    stream_cb(
+                        f"[ERROR] amcheck produced no output for "
+                        f"{SUBPROCESS_STALL_TIMEOUT_SECONDS}s and appears stuck "
+                        f"(unrecognized prompt?) — killing process"
+                    )
+                proc.kill()
+                killed = True
+                break
+
+            if item is SENTINEL:
+                break
+
+            line = item
             result.lines.append(line)
             if stream_cb:
                 stream_cb(line)
 
             if PRIMITIVE_CELL_PROMPT in line:
-                proc.stdin.write("Y\n")
-                proc.stdin.flush()
-                if stream_cb:
-                    stream_cb("  > sent: Y")
+                try:
+                    proc.stdin.write("Y\n")
+                    proc.stdin.flush()
+                    if stream_cb:
+                        stream_cb("  > sent: Y")
+                except Exception:
+                    pass
 
             response = respond_fn(line)
             if response is not None:
-                proc.stdin.write(response + "\n")
-                proc.stdin.flush()
-                result.lines.append(f"Sending response: {response}")
-                if stream_cb:
-                    stream_cb(f"  > sent: {response}")
+                try:
+                    proc.stdin.write(response + "\n")
+                    proc.stdin.flush()
+                    result.lines.append(f"Sending response: {response}")
+                    if stream_cb:
+                        stream_cb(f"  > sent: {response}")
+                except Exception:
+                    pass
 
-        proc.stdin.close()
-        proc.wait(timeout=SUBPROCESS_TIMEOUT_SECONDS)
-        result.returncode = proc.returncode
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        result.timed_out = True
-        if stream_cb:
-            stream_cb("[ERROR] amcheck timed out and was killed")
+        if not killed:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=10)
+                result.returncode = proc.returncode
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                result.timed_out = True
+                if stream_cb:
+                    stream_cb("[ERROR] amcheck did not exit after stdin close — killed")
+        else:
+            # Drain exit code without blocking indefinitely.
+            try:
+                proc.wait(timeout=10)
+                result.returncode = proc.returncode
+            except subprocess.TimeoutExpired:
+                pass
+
     except Exception as e:
         result.exception = str(e)
         if stream_cb:
             stream_cb(f"[ERROR] {e}")
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    # Always give the reader thread a bounded chance to finish; never join()
+    # without a timeout, since that could itself hang.
+    reader_thread.join(timeout=5)
 
     if stream_cb:
         stream_cb(f"[process exited with code {result.returncode}]")
@@ -333,8 +430,11 @@ def generate_input_combinations(vasp_file_path, arr, stream_cb=None, progress_cb
         output, run_result = run_amcheck(vasp_file_path, list(combo), stream_cb)
         if output == "True":
             true_count += 1
-        if run_result.exception or run_result.timed_out or (
-            run_result.returncode not in (0, None) and output is None
+        if (
+            run_result.exception
+            or run_result.timed_out
+            or run_result.stalled
+            or (run_result.returncode not in (0, None) and output is None)
         ):
             errors += 1
         if progress_cb:
@@ -358,6 +458,8 @@ def process_file(vasp_file_path, true_files_dir, sequence_map, stream_cb=None, p
             reason += f" Exception: {nn_run_result.exception}"
         if nn_run_result.timed_out:
             reason += " (process timed out)"
+        if nn_run_result.stalled:
+            reason += " (process stalled on an unrecognized prompt and was killed)"
         return {
             "File": os.path.basename(vasp_file_path),
             "Status": "Error",
@@ -406,6 +508,20 @@ def process_file(vasp_file_path, true_files_dir, sequence_map, stream_cb=None, p
         shutil.copy(vasp_file_path, dest)
 
     return result
+
+
+# --------------------------------------------------------------------------
+# Stale temp-directory cleanup
+# --------------------------------------------------------------------------
+
+def _cleanup_previous_run_dirs():
+    """Removes the output/true-files directories from the previous run
+    before starting a new one, so /tmp doesn't grow unbounded across
+    repeated 'Run analysis' clicks in a long-lived session."""
+    prev_true_dir = st.session_state.get("true_files_dir")
+    if prev_true_dir:
+        prev_output_dir = os.path.dirname(prev_true_dir)
+        shutil.rmtree(prev_output_dir, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------
@@ -669,6 +785,7 @@ run_clicked = run_col.button("▶ Run analysis", type="primary", disabled=not am
 clear_clicked = clear_col.button("🗑 Clear results")
 
 if clear_clicked:
+    _cleanup_previous_run_dirs()
     st.session_state.results = []
     st.session_state.full_log = []
     st.session_state.true_files_dir = None
@@ -680,6 +797,7 @@ if run_clicked:
         st.warning("Please upload at least one file or add a structure from Materials Project first.")
         st.stop()
 
+    _cleanup_previous_run_dirs()
     st.session_state.results = []
     st.session_state.full_log = []
 
@@ -703,7 +821,10 @@ if run_clicked:
             fh.write(item["poscar_text"])
         file_paths.append(dest)
 
-    sequence_map = build_sequence_map(MAX_N)
+    # Only ever look up sequences up to the hard atom-count limit — anything
+    # above that is rejected before a lookup happens, so there's no reason
+    # to precompute (and hold in memory) combinations beyond it.
+    sequence_map = build_sequence_map(ATOM_COUNT_HARD_LIMIT)
 
     st.subheader("Progress")
     overall_progress = st.progress(0.0, text="Starting...")
