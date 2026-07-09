@@ -6,6 +6,7 @@ your own VASP files for automated screening.
 
 ![Application Screenshot](images/Capture.PNG)
 
+
 ## 🚀 Quick Start
 
 ```bash
@@ -45,6 +46,7 @@ streamlit run streamlit_app.py
 - amcheck
 
 # 3.Installation
+
   ## Clone repository
   ```bash
 git clone https://github.com/jh5robin/altermagnet-screener.git
